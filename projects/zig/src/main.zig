@@ -264,30 +264,31 @@ test "foreign method binding" {
 }
 
 const File = struct {
-    buffer: [32]u8 = undefined,
+    buffer: [4096]u8 = undefined,
     slice: []u8 = undefined,
+    fn from_anyopaque(self_ptr_opt: ?*anyopaque) *@This() {
+        const self_ptr = self_ptr_opt orelse @panic("Passed null self ptr");
+        return @ptrCast(*@This(), @constCast(@alignCast(@alignOf(@This()), self_ptr)));
+    }
     fn allocate(vm_opt: ?*c.WrenVM) callconv(.C) void {
         const vm = vm_opt orelse @panic("Passed null vm");
-        const contexts = wren_contexts_global orelse @panic("No wren contexts registered");
-        const ctx = contexts.get(vm) orelse @panic("Unregistered context");
-        _ = ctx;
-        const data = c.wrenSetSlotNewForeign(vm, 0, 0, @sizeOf(@This()));
-        _ = data;
+        const self = File.from_anyopaque(c.wrenSetSlotNewForeign(vm, 0, 0, @sizeOf(@This())));
+        const path = c.wrenGetSlotString(vm, 1);
+        self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}\n", .{path}) catch @panic("Couldn't bufPrint");
     }
     fn write(vm_opt: ?*c.WrenVM) callconv(.C) void {
         const vm = vm_opt orelse @panic("Passed null vm");
-        const self = @ptrCast(*@This(), @constCast(@alignCast(@alignOf(@This()), &c.wrenGetSlotForeign(vm, 0))));
+        const self = File.from_anyopaque(c.wrenGetSlotForeign(vm, 0));
         const text_res = c.wrenGetSlotString(vm, 1);
         const text = std.mem.span(text_res);
-        self.slice = std.fmt.bufPrint(&self.buffer, "{s}", .{text}) catch @panic("Couldn't bufPrint");
+        self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}", .{text}) catch @panic("Couldn't bufPrint");
     }
     fn close(vm_opt: ?*c.WrenVM) callconv(.C) void {
         _ = vm_opt;
     }
     fn finalize(self_ptr: ?*anyopaque) callconv(.C) void {
         const self = @ptrCast(*@This(), @alignCast(@alignOf(@This()), self_ptr));
-        std.debug.print("finalizing {*}, buffer is {s}\n", .{ self, self.buffer });
-        self.* = undefined;
+        std.debug.print("finalizing {*}, buffer is {s}\n", .{ self, self.slice });
     }
 };
 
@@ -333,6 +334,9 @@ test "foreign class" {
         \\  foreign write(text)
         \\  foreign close()
         \\}
+        \\var file = File.create("some/path.txt")
+        \\file.write("hello!")
+        \\file.close()
     ;
 
     try handle_result(c.wrenInterpret(vm, module, script));

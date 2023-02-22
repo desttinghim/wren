@@ -24,6 +24,10 @@ pub fn init(opt: Options) Wren {
     return self;
 }
 
+pub fn getVersionNumber() c_int {
+    return c.wrenGetVersionNumber();
+}
+
 pub fn new(self: *Wren) !*VM {
     var vm: *c.WrenVM = c.wrenNewVM(&self.config) orelse return error.NullVM;
     return @ptrCast(*VM, vm);
@@ -41,6 +45,9 @@ const VM = opaque {
     pub fn deinit(vm: *VM) void {
         c.wrenFreeVM(vm.as_raw());
     }
+    pub fn collectGarbage(vm: *VM) void {
+        c.wrenCollectGarbage(vm.as_raw());
+    }
     pub fn interpret(vm: *VM, module: [*:0]const u8, script: [*:0]const u8) !void {
         try handle_result(c.wrenInterpret(vm.as_raw(), module, script));
     }
@@ -53,54 +60,129 @@ const VM = opaque {
     pub fn releaseHandle(vm: *VM, handle: *c.WrenHandle) !void {
         try handle_result(c.wrenReleaseHandle(vm.as_raw(), handle));
     }
+    pub fn getSlotCount(vm: *VM) c_int {
+        return c.wrenGetSlotCount(vm.as_raw());
+    }
     pub fn ensureSlots(vm: *VM, numSlots: c_int) void {
         c.wrenEnsureSlots(vm.as_raw(), numSlots);
     }
-    const WrenType = enum {
+    pub fn getSlotType(vm: *VM) c.WrenType {
+        return c.wrenGetSlotType(vm.as_raw());
+    }
+    const WrenInterfaceType = enum {
         Bool,
+        Bytes,
         Double,
         Foreign,
-        List,
-        Map,
-        Null,
         String,
         Handle,
-        Unknown,
-        pub fn as_string(T: WrenType) []const u8 {
+        pub fn as_string(T: @This()) []const u8 {
             return @tagName(T);
         }
-        pub fn as_zig_type(comptime T: WrenType) type {
+        pub fn as_zig_type(comptime T: @This()) type {
             return switch (T) {
                 .Bool => bool,
+                .Bytes => ?[]const u8,
                 .Double => f64,
                 .Foreign => ?*anyopaque,
-                .List => ?*anyopaque,
-                .Map => ?*anyopaque,
                 .String => ?[*:0]const u8,
                 .Handle => ?*c.WrenHandle,
-                else => @compileError("No Zig type for Wren type " ++ T.as_string()),
             };
         }
     };
-    pub fn getSlot(vm: *VM, comptime T: WrenType, slot: c_int) T.as_zig_type() {
-        const func = "wrenGetSlot" ++ comptime T.as_string();
-        return @call(.auto, @field(c, func), .{ vm.as_raw(), slot });
+    pub fn getSlot(vm: *VM, comptime T: WrenInterfaceType, slot: c_int) T.as_zig_type() {
+        switch (T) {
+            .Bytes => {
+                var len: c_int = undefined;
+                var ptr = c.wrenGetSlotBytes(vm.as_raw(), slot, &len);
+                return ptr[0..len];
+            },
+            else => |t| return @call(.auto, @field(c, "wrenGetSlot" ++ t.as_string()), .{ vm.as_raw(), slot }),
+        }
     }
-    pub fn setSlot(vm: *VM, comptime T: WrenType, slot: c_int, value: T.as_zig_type()) void {
-        const func = "wrenSetSlot" ++ comptime T.as_string();
-        return @call(.auto, @field(c, func), .{ vm.as_raw(), slot, value });
+    pub fn setSlot(vm: *VM, comptime T: WrenInterfaceType, slot: c_int, value: T.as_zig_type()) void {
+        switch (T) {
+            .Bytes => {
+                c.wrenSetSlotBytes(vm.as_raw(), value.ptr, value.len);
+            },
+            else => |t| @call(.auto, @field(c, "wrenSetSlot" ++ t.as_string()), .{ vm.as_raw(), slot, value }),
+        }
     }
+
+    // Foreign
     pub fn setSlotNewForeign(vm: *VM, slot: c_int, class_slot: c_int, size: usize) ?*anyopaque {
         return c.wrenSetSlotNewForeign(vm.as_raw(), slot, class_slot, size);
     }
+
+    // Reference types
+    const WrenRefType = union(enum) {
+        List,
+        Map,
+        Null,
+    };
+
+    pub fn setSlotNew(vm: *VM, comptime T: WrenRefType, slot: c_int) void {
+        @call(.auto, @field(c, "wrenSetSlotNew" ++ @tagName(T)), .{ vm.as_raw(), slot });
+    }
+
+    // Lists
+    pub fn getListCount(vm: *VM, slot: c_int) c_int {
+        return c.wrenGetListCount(vm.as_raw(), slot);
+    }
+
+    pub fn getListElement(vm: *VM, list_slot: c_int, index: c_int, element_slot: c_int) void {
+        return c.wrenGetListElement(vm.as_raw(), list_slot, index, element_slot);
+    }
+
+    pub fn setListElement(vm: *VM, list_slot: c_int, index: c_int, element_slot: c_int) void {
+        return c.wrenSetListElement(vm.as_raw(), list_slot, index, element_slot);
+    }
+
+    pub fn insertInList(vm: *VM, list_slot: c_int, index: c_int, element_slot: c_int) void {
+        return c.wrenInsertInList(vm.as_raw(), list_slot, index, element_slot);
+    }
+
+    // Maps
+    pub fn getMapCount(vm: *VM, slot: c_int) c_int {
+        return c.wrenGetMapCount(vm.as_raw(), slot);
+    }
+
+    pub fn getMapContainsKey(vm: *VM, map_slot: c_int, key_slot: c_int) bool {
+        return c.wrenGetMapContainsKey(vm.as_raw(), map_slot, key_slot);
+    }
+
+    pub fn getMapValue(vm: *VM, map_slot: c_int, key_slot: c_int, value_slot: c_int) void {
+        return c.wrenGetMapValue(vm.as_raw(), map_slot, key_slot, value_slot);
+    }
+
+    pub fn setMapValue(vm: *VM, map_slot: c_int, key_slot: c_int, value_slot: c_int) void {
+        return c.wrenSetMapValue(vm.as_raw(), map_slot, key_slot, value_slot);
+    }
+
+    pub fn removeMapValue(vm: *VM, map_slot: c_int, key_slot: c_int, removed_value_slot: c_int) void {
+        return c.wrenInsertInMap(vm.as_raw(), map_slot, key_slot, removed_value_slot);
+    }
+
+    // Variables
     pub fn getVariable(vm: *VM, module: [*:0]const u8, name: [*:0]const u8, slot: c_int) void {
         c.wrenGetVariable(vm.as_raw(), module, name, slot);
     }
-    pub fn setUserData(vm: *VM, user_data: *anyopaque) void {
-        c.wrenSetUserData(vm.as_raw(), user_data);
+    pub fn hasVariable(vm: *VM, module: [*:0]const u8, name: [*:0]const u8) bool {
+        return c.wrenHasVariable(vm.as_raw(), module, name);
+    }
+
+    // Runtime
+    pub fn hasModule(vm: *VM, module: [*:0]const u8) bool {
+        return c.wrenHasModule(vm.as_raw(), module);
+    }
+    pub fn abortFiber(vm: *VM, slot: c_int) bool {
+        return c.wrenAbortFiber(vm.as_raw(), slot);
     }
     pub fn getUserData(vm: *VM) ?*anyopaque {
         return c.wrenGetUserData(vm.as_raw());
+    }
+    pub fn setUserData(vm: *VM, user_data: *anyopaque) void {
+        c.wrenSetUserData(vm.as_raw(), user_data);
     }
 };
 

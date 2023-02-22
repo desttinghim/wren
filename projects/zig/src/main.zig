@@ -56,11 +56,20 @@ const VM = opaque {
     pub fn ensureSlots(vm: *VM, numSlots: c_int) void {
         c.wrenEnsureSlots(vm.as_raw(), numSlots);
     }
+    pub fn getSlotForeign(vm: *VM, slot: c_int) ?*anyopaque {
+        return c.wrenGetSlotForeign(vm.as_raw(), slot);
+    }
+    pub fn getSlotString(vm: *VM, slot: c_int) ?[*:0]const u8 {
+        return c.wrenGetSlotString(vm.as_raw(), slot);
+    }
     pub fn getSlotHandle(vm: *VM, slot: c_int) ?*c.WrenHandle {
         return c.wrenGetSlotHandle(vm.as_raw(), slot);
     }
     pub fn setSlotDouble(vm: *VM, slot: c_int, double: f64) void {
         c.wrenSetSlotDouble(vm.as_raw(), slot, double);
+    }
+    pub fn setSlotNewForeign(vm: *VM, slot: c_int, class_slot: c_int, size: usize) ?*anyopaque {
+        return c.wrenSetSlotNewForeign(vm.as_raw(), slot, class_slot, size);
     }
     pub fn setSlotHandle(vm: *VM, slot: c_int, handle: *c.WrenHandle) void {
         c.wrenSetSlotHandle(vm.as_raw(), slot, handle);
@@ -275,81 +284,62 @@ test "foreign method binding" {
     , harness.log.items);
 }
 
-// const File = struct {
-//     buffer: [4096]u8 = undefined,
-//     slice: []u8 = undefined,
-//     fn from_anyopaque(self_ptr_opt: ?*anyopaque) *@This() {
-//         const self_ptr = self_ptr_opt orelse @panic("Passed null self ptr");
-//         return @ptrCast(*@This(), @constCast(@alignCast(@alignOf(@This()), self_ptr)));
-//     }
-//     fn allocate(vm_opt: ?*c.WrenVM) callconv(.C) void {
-//         const vm = vm_opt orelse @panic("Passed null vm");
-//         const self = File.from_anyopaque(c.wrenSetSlotNewForeign(vm, 0, 0, @sizeOf(@This())));
-//         const path = c.wrenGetSlotString(vm, 1);
-//         self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}\n", .{path}) catch @panic("Couldn't bufPrint");
-//     }
-//     fn write(vm_opt: ?*c.WrenVM) callconv(.C) void {
-//         const vm = vm_opt orelse @panic("Passed null vm");
-//         const self = File.from_anyopaque(c.wrenGetSlotForeign(vm, 0));
-//         const text_res = c.wrenGetSlotString(vm, 1);
-//         const text = std.mem.span(text_res);
-//         self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}", .{text}) catch @panic("Couldn't bufPrint");
-//     }
-//     fn close(vm_opt: ?*c.WrenVM) callconv(.C) void {
-//         _ = vm_opt;
-//     }
-//     fn finalize(self_ptr: ?*anyopaque) callconv(.C) void {
-//         const self = @ptrCast(*@This(), @alignCast(@alignOf(@This()), self_ptr));
-//         std.debug.print("finalizing {*}, buffer is {s}\n", .{ self, self.slice });
-//     }
-// };
+const File = struct {
+    buffer: [4096]u8 = undefined,
+    slice: []u8 = undefined,
+    fn from_anyopaque(self_ptr_opt: ?*anyopaque) *@This() {
+        const self_ptr = self_ptr_opt orelse @panic("Passed null self ptr");
+        return @ptrCast(*@This(), @constCast(@alignCast(@alignOf(@This()), self_ptr)));
+    }
+    fn allocate(vm_opt: ?*c.WrenVM) callconv(.C) void {
+        const vm = VM.from_anyopaque(vm_opt);
+        const self = File.from_anyopaque(vm.setSlotNewForeign(0, 0, @sizeOf(@This())));
+        const path = vm.getSlotString(1) orelse @panic("Couldn't get slot string");
+        self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}\n", .{path}) catch @panic("Couldn't bufPrint");
+    }
+    fn write(vm_opt: ?*c.WrenVM) callconv(.C) void {
+        const vm = VM.from_anyopaque(vm_opt);
+        const self = File.from_anyopaque(vm.getSlotForeign(0));
+        const text_res = vm.getSlotString(1) orelse @panic("Couldn't get slot string");
+        const text = std.mem.span(text_res);
+        self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}", .{text}) catch @panic("Couldn't bufPrint");
+    }
+    fn close(vm_opt: ?*c.WrenVM) callconv(.C) void {
+        _ = vm_opt;
+    }
+    fn finalize(self_ptr: ?*anyopaque) callconv(.C) void {
+        const self = @ptrCast(*@This(), @alignCast(@alignOf(@This()), self_ptr));
+        self.* = undefined;
+    }
+};
 
-// test "foreign class" {
-//     var log = std.ArrayList(u8).init(testing.allocator);
-//     defer log.deinit();
+test "foreign class" {
+    var harness = TestHarness{};
+    try harness.init();
+    defer harness.deinit();
 
-//     var methods = std.StringHashMap(c.WrenForeignMethodFn).init(testing.allocator);
-//     defer methods.deinit();
+    try harness.classes.put(testing.allocator, "main/File", .{ .allocate = File.allocate, .finalize = File.finalize });
+    try harness.methods.put(testing.allocator, "main/File.write(_)", File.write);
+    try harness.methods.put(testing.allocator, "main/File.close()", File.close);
 
-//     var classes = std.StringHashMap(c.WrenForeignClassMethods).init(testing.allocator);
-//     defer classes.deinit();
+    const module = "main";
+    const script =
+        \\foreign class File {
+        \\  construct create(path) {}
+        \\
+        \\  foreign write(text)
+        \\  foreign close()
+        \\}
+        \\var file = File.create("some/path.txt")
+        \\file.write("hello!")
+        \\file.close()
+    ;
 
-//     var config: c.WrenConfiguration = undefined;
-//     c.wrenInitConfiguration(&config);
-//     {
-//         // Configure wren
-//         config.writeFn = writeFn;
-//         config.errorFn = errorFn;
-//         config.bindForeignClassFn = bindForeignClass;
-//         config.bindForeignMethodFn = bindForeignMethod;
-//     }
-
-//     var vm: *c.WrenVM = c.wrenNewVM(&config) orelse return error.NullVM;
-//     defer c.wrenFreeVM(vm);
-
-//     try register_context(vm, .{
-//         .log_list = &log,
-//         .methods = &methods,
-//         .classes = &classes,
-//     });
-//     defer free_all_contexts();
-
-//     try methods.put("main/File.write(_)", File.write);
-//     try methods.put("main/File.close()", File.close);
-//     try classes.put("main/File", .{ .allocate = File.allocate, .finalize = File.finalize });
-
-//     const module = "main";
-//     const script =
-//         \\foreign class File {
-//         \\  construct create(path) {}
-//         \\
-//         \\  foreign write(text)
-//         \\  foreign close()
-//         \\}
-//         \\var file = File.create("some/path.txt")
-//         \\file.write("hello!")
-//         \\file.close()
-//     ;
-
-//     try handle_result(c.wrenInterpret(vm, module, script));
-// }
+    try harness.vm.interpret(module, script);
+    try testing.expectEqualStrings(
+        \\Looking for class: main/File
+        \\Looking for method: main/File.write(_)
+        \\Looking for method: main/File.close()
+        \\
+    , harness.log.items);
+}

@@ -56,23 +56,42 @@ const VM = opaque {
     pub fn ensureSlots(vm: *VM, numSlots: c_int) void {
         c.wrenEnsureSlots(vm.as_raw(), numSlots);
     }
-    pub fn getSlotForeign(vm: *VM, slot: c_int) ?*anyopaque {
-        return c.wrenGetSlotForeign(vm.as_raw(), slot);
+    const WrenType = enum {
+        Bool,
+        Double,
+        Foreign,
+        List,
+        Map,
+        Null,
+        String,
+        Handle,
+        Unknown,
+        pub fn as_string(T: WrenType) []const u8 {
+            return @tagName(T);
+        }
+        pub fn as_zig_type(comptime T: WrenType) type {
+            return switch (T) {
+                .Bool => bool,
+                .Double => f64,
+                .Foreign => ?*anyopaque,
+                .List => ?*anyopaque,
+                .Map => ?*anyopaque,
+                .String => ?[*:0]const u8,
+                .Handle => ?*c.WrenHandle,
+                else => @compileError("No Zig type for Wren type " ++ T.as_string()),
+            };
+        }
+    };
+    pub fn getSlot(vm: *VM, comptime T: WrenType, slot: c_int) T.as_zig_type() {
+        const func = "wrenGetSlot" ++ comptime T.as_string();
+        return @call(.auto, @field(c, func), .{ vm.as_raw(), slot });
     }
-    pub fn getSlotString(vm: *VM, slot: c_int) ?[*:0]const u8 {
-        return c.wrenGetSlotString(vm.as_raw(), slot);
-    }
-    pub fn getSlotHandle(vm: *VM, slot: c_int) ?*c.WrenHandle {
-        return c.wrenGetSlotHandle(vm.as_raw(), slot);
-    }
-    pub fn setSlotDouble(vm: *VM, slot: c_int, double: f64) void {
-        c.wrenSetSlotDouble(vm.as_raw(), slot, double);
+    pub fn setSlot(vm: *VM, comptime T: WrenType, slot: c_int, value: T.as_zig_type()) void {
+        const func = "wrenSetSlot" ++ comptime T.as_string();
+        return @call(.auto, @field(c, func), .{ vm.as_raw(), slot, value });
     }
     pub fn setSlotNewForeign(vm: *VM, slot: c_int, class_slot: c_int, size: usize) ?*anyopaque {
         return c.wrenSetSlotNewForeign(vm.as_raw(), slot, class_slot, size);
-    }
-    pub fn setSlotHandle(vm: *VM, slot: c_int, handle: *c.WrenHandle) void {
-        c.wrenSetSlotHandle(vm.as_raw(), slot, handle);
     }
     pub fn getVariable(vm: *VM, module: [*:0]const u8, name: [*:0]const u8, slot: c_int) void {
         c.wrenGetVariable(vm.as_raw(), module, name, slot);
@@ -238,12 +257,12 @@ test "call static method" {
 
     harness.vm.ensureSlots(1);
     harness.vm.getVariable(module, "GameEngine", 0);
-    const game_engine_class = harness.vm.getSlotHandle(0) orelse return error.GetSlot;
+    const game_engine_class = harness.vm.getSlot(.Handle, 0) orelse return error.GetSlot;
     const update_method = harness.vm.makeCallHandle("update(_)") orelse return error.MakeCallHandle;
     {
         // Perform GameEngine.update method call
-        harness.vm.setSlotHandle(0, game_engine_class);
-        harness.vm.setSlotDouble(1, 6.9);
+        harness.vm.setSlot(.Handle, 0, game_engine_class);
+        harness.vm.setSlot(.Double, 1, 6.9);
         try harness.vm.call(update_method);
     }
 
@@ -294,13 +313,13 @@ const File = struct {
     fn allocate(vm_opt: ?*c.WrenVM) callconv(.C) void {
         const vm = VM.from_anyopaque(vm_opt);
         const self = File.from_anyopaque(vm.setSlotNewForeign(0, 0, @sizeOf(@This())));
-        const path = vm.getSlotString(1) orelse @panic("Couldn't get slot string");
+        const path = vm.getSlot(.String, 1) orelse @panic("Couldn't get slot string");
         self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}\n", .{path}) catch @panic("Couldn't bufPrint");
     }
     fn write(vm_opt: ?*c.WrenVM) callconv(.C) void {
         const vm = VM.from_anyopaque(vm_opt);
-        const self = File.from_anyopaque(vm.getSlotForeign(0));
-        const text_res = vm.getSlotString(1) orelse @panic("Couldn't get slot string");
+        const self = File.from_anyopaque(vm.getSlot(.Foreign, 0));
+        const text_res = vm.getSlot(.String, 1) orelse @panic("Couldn't get slot string");
         const text = std.mem.span(text_res);
         self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}", .{text}) catch @panic("Couldn't bufPrint");
     }

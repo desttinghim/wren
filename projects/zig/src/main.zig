@@ -241,52 +241,39 @@ test "call static method" {
     try testing.expectEqualStrings("6.9\n", harness.log.items);
 }
 
-// fn add(vm_opt: ?*c.WrenVM) callconv(.C) void {
-//     const vm = vm_opt orelse {
-//         std.debug.print("Passed null vm\n", .{});
-//         return;
-//     };
-//     const a = c.wrenGetSlotDouble(vm, 1);
-//     const b = c.wrenGetSlotDouble(vm, 2);
-//     c.wrenSetSlotDouble(vm, 0, a + b);
-// }
+fn add(vm_opt: ?*c.WrenVM) callconv(.C) void {
+    const vm = vm_opt orelse {
+        std.debug.print("Passed null vm\n", .{});
+        return;
+    };
+    const a = c.wrenGetSlotDouble(vm, 1);
+    const b = c.wrenGetSlotDouble(vm, 2);
+    c.wrenSetSlotDouble(vm, 0, a + b);
+}
 
-// test "foreign method binding" {
-//     var log = std.ArrayList(u8).init(testing.allocator);
-//     defer log.deinit();
+test "foreign method binding" {
+    var harness = TestHarness{};
+    try harness.init();
+    defer harness.deinit();
 
-//     var methods = std.StringHashMap(c.WrenForeignMethodFn).init(testing.allocator);
-//     defer methods.deinit();
+    try harness.methods.put(testing.allocator, "main/Math.add(_,_)static", add);
 
-//     var config: c.WrenConfiguration = undefined;
-//     c.wrenInitConfiguration(&config);
-//     {
-//         // Configure wren
-//         config.writeFn = writeFn;
-//         config.errorFn = errorFn;
-//         config.bindForeignMethodFn = bindForeignMethod;
-//     }
+    const module = "main";
+    const script =
+        \\class Math {
+        \\  foreign static add(a, b)
+        \\}
+        \\System.print(Math.add(5, 4))
+    ;
 
-//     var vm: *c.WrenVM = c.wrenNewVM(&config) orelse return error.NullVM;
-//     defer c.wrenFreeVM(vm);
+    try harness.vm.interpret(module, script);
 
-//     try register_context(vm, .{
-//         .log_list = &log,
-//         .methods = &methods,
-//     });
-//     defer free_all_contexts();
-
-//     try methods.put("main/Math.add(_,_)static", add);
-
-//     const module = "main";
-//     const script =
-//         \\class Math {
-//         \\  foreign static add(a, b)
-//         \\}
-//     ;
-
-//     try handle_result(c.wrenInterpret(vm, module, script));
-// }
+    try testing.expectEqualStrings(
+        \\Looking for method: main/Math.add(_,_)static
+        \\9
+        \\
+    , harness.log.items);
+}
 
 // const File = struct {
 //     buffer: [4096]u8 = undefined,

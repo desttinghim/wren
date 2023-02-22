@@ -2,18 +2,60 @@ const std = @import("std");
 const testing = std.testing;
 const c = @import("c.zig");
 
-pub fn writeFn(vm_opt: ?*c.WrenVM, text_opt: ?[*:0]const u8) callconv(.C) void {
-    const vm = vm_opt orelse @panic("Passed null vm");
-    _ = vm;
-    const text = text_opt orelse "null";
-    std.debug.print("{s}", .{text});
+const WrenCtx = @This();
+
+var wren_contexts_global: ?std.AutoHashMap(*c.WrenVM, WrenCtx) = undefined;
+
+log: ?*std.ArrayList(u8),
+log_to_stdout: bool,
+
+modules: ?*std.StringHashMap(c.WrenForeignMethodFn),
+
+const WrenVMOptions = struct {
+    log_to_stdout: bool = false,
+    log_list: ?*std.ArrayList(u8) = null,
+    modules: ?*std.StringHashMap(c.WrenForeignMethodFn) = null,
+};
+
+pub fn register_context(vm: *c.WrenVM, opt: WrenVMOptions) !void {
+    std.debug.print("Registering {*} as wrenvm ptr\n", .{vm});
+
+    _ = wren_contexts_global orelse contexts: {
+        wren_contexts_global = std.AutoHashMap(*c.WrenVM, WrenCtx).init(testing.allocator);
+        break :contexts wren_contexts_global.?;
+    };
+    var wren_contexts = &wren_contexts_global.?;
+
+    try wren_contexts.put(vm, .{
+        .log = opt.log_list,
+        .log_to_stdout = opt.log_to_stdout,
+        .modules = opt.modules,
+    });
 }
 
-var vm_logs: std.AutoHashMap(*c.WrenVM, std.ArrayList(u8)) = undefined;
-fn testWriteFn(vm_opt: ?*c.WrenVM, text_opt: ?[*:0]const u8) callconv(.C) void {
+pub fn free_all_contexts() void {
+    var wren_contexts = &(wren_contexts_global orelse return);
+    wren_contexts.deinit();
+    wren_contexts.* = undefined;
+    wren_contexts_global = null;
+    // var iter = wren_contexts.iterator();
+    // while (iter.next()) |context| {
+    //     c.wrenFreeVM(context.key_ptr.*);
+    // }
+}
+
+pub fn writeFn(vm_opt: ?*c.WrenVM, text_opt: ?[*:0]const u8) callconv(.C) void {
     const vm = vm_opt orelse @panic("Passed null vm");
+    std.debug.print("writefn recieved {*} as wrenvm ptr\n", .{vm});
+    const contexts = wren_contexts_global orelse @panic("No wren contexts registered");
+    const ctx = contexts.get(vm) orelse @panic("Unregistered context");
     const text = text_opt orelse "null";
-    if (vm_logs.getPtr(vm)) |array_list| {
+
+    if (ctx.log_to_stdout) {
+        std.debug.print("{s}", .{text});
+    }
+
+    if (ctx.log) |array_list| {
         std.fmt.format(array_list.writer(), "{s}", .{text}) catch |e| {
             std.debug.print("Error while logging: {s}", .{@errorName(e)});
         };
@@ -39,6 +81,31 @@ pub fn errorFn(
     }
 }
 
+pub fn bindForeignMethod(
+    vm_opt: ?*c.WrenVM,
+    module_opt: ?[*:0]const u8,
+    class_name_opt: ?[*:0]const u8,
+    is_static: bool,
+    signature_opt: ?[*:0]const u8,
+) callconv(.C) c.WrenForeignMethodFn {
+    const vm = vm_opt orelse @panic("Passed null vm");
+    const contexts = wren_contexts_global orelse @panic("No wren contexts registered");
+    const ctx = contexts.get(vm) orelse @panic("Unregistered context");
+    const modules = ctx.modules orelse @panic("couldn't find modules");
+
+    const module = module_opt orelse @panic("Passed null module");
+    const class_name = class_name_opt orelse @panic("Passed null class_name");
+    const signature = signature_opt orelse @panic("Passed null signature");
+
+    var buffer: [4096]u8 = undefined;
+
+    const name = std.fmt.bufPrintZ(&buffer, "{s}/{s}.{s}{s}", .{ module, class_name, signature, if (is_static) "static" else "" }) catch return null;
+
+    std.debug.print("Looking for method: {s}", .{name});
+
+    return modules.get(name) orelse null;
+}
+
 pub fn handle_result(result: c.WrenInterpretResult) !void {
     switch (result) {
         c.WREN_RESULT_SUCCESS => {},
@@ -49,68 +116,50 @@ pub fn handle_result(result: c.WrenInterpretResult) !void {
 }
 
 test "init wren vm" {
+    var log = std.ArrayList(u8).init(testing.allocator);
+    defer log.deinit();
+
     var config: c.WrenConfiguration = undefined;
     c.wrenInitConfiguration(&config);
     {
         // Configure wren
-        config.writeFn = testWriteFn;
+        config.writeFn = writeFn;
         config.errorFn = errorFn;
     }
 
     var vm: *c.WrenVM = c.wrenNewVM(&config) orelse return error.NullVM;
     defer c.wrenFreeVM(vm);
 
-    vm_logs = std.AutoHashMap(*c.WrenVM, std.ArrayList(u8)).init(testing.allocator);
-    defer {
-        var iter = vm_logs.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        vm_logs.deinit();
-    }
-
-    try vm_logs.put(vm, std.ArrayList(u8).init(testing.allocator));
+    try register_context(vm, .{ .log_list = &log });
+    defer free_all_contexts();
 
     const module = "main";
     const script =
         \\System.print("I am running in a VM!")
     ;
 
-    var result: c.WrenInterpretResult = c.wrenInterpret(vm, module, script);
-    switch (result) {
-        c.WREN_RESULT_COMPILE_ERROR => std.debug.print("Compile Error!\n", .{}),
-        c.WREN_RESULT_RUNTIME_ERROR => std.debug.print("Runtime Error!\n", .{}),
-        c.WREN_RESULT_SUCCESS => std.debug.print("Success\n", .{}),
-        else => return error.UnexpectedResult,
-    }
-
-    const log = vm_logs.get(vm) orelse return error.UnitializedLog;
+    try handle_result(c.wrenInterpret(vm, module, script));
 
     try testing.expectEqualStrings("I am running in a VM!\n", log.items);
 }
 
 test "call static method" {
+    var log = std.ArrayList(u8).init(testing.allocator);
+    defer log.deinit();
+
     var config: c.WrenConfiguration = undefined;
     c.wrenInitConfiguration(&config);
     {
         // Configure wren
-        config.writeFn = testWriteFn;
+        config.writeFn = writeFn;
         config.errorFn = errorFn;
     }
 
     var vm: *c.WrenVM = c.wrenNewVM(&config) orelse return error.NullVM;
     defer c.wrenFreeVM(vm);
 
-    vm_logs = std.AutoHashMap(*c.WrenVM, std.ArrayList(u8)).init(testing.allocator);
-    defer {
-        var iter = vm_logs.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        vm_logs.deinit();
-    }
-
-    try vm_logs.put(vm, std.ArrayList(u8).init(testing.allocator));
+    try register_context(vm, .{ .log_list = &log });
+    defer free_all_contexts();
 
     const module = "main";
     const script =
@@ -134,7 +183,52 @@ test "call static method" {
         try handle_result(c.wrenCall(vm, update_method));
     }
 
-    const log = vm_logs.get(vm) orelse return error.UnitializedLog;
-
     try testing.expectEqualStrings("6.9\n", log.items);
+}
+
+fn add(vm_opt: ?*c.WrenVM) callconv(.C) void {
+    const vm = vm_opt orelse {
+        std.debug.print("Passed null vm\n", .{});
+        return;
+    };
+    const a = c.wrenGetSlotDouble(vm, 1);
+    const b = c.wrenGetSlotDouble(vm, 2);
+    c.wrenSetSlotDouble(vm, 0, a + b);
+}
+
+test "foreign method binding" {
+    var log = std.ArrayList(u8).init(testing.allocator);
+    defer log.deinit();
+
+    var modules = std.StringHashMap(c.WrenForeignMethodFn).init(testing.allocator);
+    defer modules.deinit();
+
+    var config: c.WrenConfiguration = undefined;
+    c.wrenInitConfiguration(&config);
+    {
+        // Configure wren
+        config.writeFn = writeFn;
+        config.errorFn = errorFn;
+        config.bindForeignMethodFn = bindForeignMethod;
+    }
+
+    var vm: *c.WrenVM = c.wrenNewVM(&config) orelse return error.NullVM;
+    defer c.wrenFreeVM(vm);
+
+    try register_context(vm, .{
+        .log_list = &log,
+        .modules = &modules,
+    });
+    defer free_all_contexts();
+
+    try modules.put("main/Math.add(_,_)static", add);
+
+    const module = "main";
+    const script =
+        \\class Math {
+        \\  foreign static add(a, b)
+        \\}
+    ;
+
+    try handle_result(c.wrenInterpret(vm, module, script));
 }

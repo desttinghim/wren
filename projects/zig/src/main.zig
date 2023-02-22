@@ -444,3 +444,33 @@ test "foreign class" {
         \\
     , harness.log.items);
 }
+
+test "hello fibers" {
+    var harness = TestHarness{};
+    try harness.init();
+    defer harness.deinit();
+
+    const module = "main";
+    const script =
+        \\System.print("Hello, world!")
+        \\class Wren {
+        \\  flyTo(city) {
+        \\    System.print("Flying to %(city)")
+        \\  }
+        \\}
+        \\var adjectives = Fiber.new {
+        \\  ["small", "clean", "fast"].each {|word| Fiber.yield(word) }
+        \\}
+        \\while (!adjectives.isDone) System.print(adjectives.call())
+    ;
+
+    try harness.vm.interpret(module, script);
+    try testing.expectEqualStrings(
+        \\Hello, world!
+        \\small
+        \\clean
+        \\fast
+        \\null
+        \\
+    , harness.log.items);
+}

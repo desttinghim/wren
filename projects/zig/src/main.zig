@@ -44,6 +44,30 @@ const VM = opaque {
     pub fn interpret(vm: *VM, module: [*:0]const u8, script: [*:0]const u8) !void {
         try handle_result(c.wrenInterpret(vm.as_raw(), module, script));
     }
+    pub fn makeCallHandle(vm: *VM, signature: [*:0]const u8) ?*c.WrenHandle {
+        return c.wrenMakeCallHandle(vm.as_raw(), signature);
+    }
+    pub fn call(vm: *VM, method: *c.WrenHandle) !void {
+        try handle_result(c.wrenCall(vm.as_raw(), method));
+    }
+    pub fn releaseHandle(vm: *VM, handle: *c.WrenHandle) !void {
+        try handle_result(c.wrenReleaseHandle(vm.as_raw(), handle));
+    }
+    pub fn ensureSlots(vm: *VM, numSlots: c_int) void {
+        c.wrenEnsureSlots(vm.as_raw(), numSlots);
+    }
+    pub fn getSlotHandle(vm: *VM, slot: c_int) ?*c.WrenHandle {
+        return c.wrenGetSlotHandle(vm.as_raw(), slot);
+    }
+    pub fn setSlotDouble(vm: *VM, slot: c_int, double: f64) void {
+        c.wrenSetSlotDouble(vm.as_raw(), slot, double);
+    }
+    pub fn setSlotHandle(vm: *VM, slot: c_int, handle: *c.WrenHandle) void {
+        c.wrenSetSlotHandle(vm.as_raw(), slot, handle);
+    }
+    pub fn getVariable(vm: *VM, module: [*:0]const u8, name: [*:0]const u8, slot: c_int) void {
+        c.wrenGetVariable(vm.as_raw(), module, name, slot);
+    }
     pub fn setUserData(vm: *VM, user_data: *anyopaque) void {
         c.wrenSetUserData(vm.as_raw(), user_data);
     }
@@ -187,48 +211,35 @@ test "init wren vm" {
     try testing.expectEqualStrings("I am running in a VM!\n", harness.log.items);
 }
 
-// test "call static method" {
-//     var log = std.ArrayList(u8).init(testing.allocator);
-//     defer log.deinit();
+test "call static method" {
+    var harness = TestHarness{};
+    try harness.init();
+    defer harness.deinit();
 
-//     var config: c.WrenConfiguration = undefined;
-//     c.wrenInitConfiguration(&config);
-//     {
-//         // Configure wren
-//         config.writeFn = writeFn;
-//         config.errorFn = errorFn;
-//     }
+    const module = "main";
+    const script =
+        \\class GameEngine {
+        \\  static update(elapsedTime) {
+        \\    System.print(elapsedTime)
+        \\  }
+        \\}
+    ;
 
-//     var vm: *c.WrenVM = c.wrenNewVM(&config) orelse return error.NullVM;
-//     defer c.wrenFreeVM(vm);
+    try harness.vm.interpret(module, script);
 
-//     try register_context(vm, .{ .log_list = &log });
-//     defer free_all_contexts();
+    harness.vm.ensureSlots(1);
+    harness.vm.getVariable(module, "GameEngine", 0);
+    const game_engine_class = harness.vm.getSlotHandle(0) orelse return error.GetSlot;
+    const update_method = harness.vm.makeCallHandle("update(_)") orelse return error.MakeCallHandle;
+    {
+        // Perform GameEngine.update method call
+        harness.vm.setSlotHandle(0, game_engine_class);
+        harness.vm.setSlotDouble(1, 6.9);
+        try harness.vm.call(update_method);
+    }
 
-//     const module = "main";
-//     const script =
-//         \\class GameEngine {
-//         \\  static update(elapsedTime) {
-//         \\    System.print(elapsedTime)
-//         \\  }
-//         \\}
-//     ;
-
-//     try handle_result(c.wrenInterpret(vm, module, script));
-
-//     c.wrenEnsureSlots(vm, 1);
-//     c.wrenGetVariable(vm, "main", "GameEngine", 0);
-//     const game_engine_class = c.wrenGetSlotHandle(vm, 0);
-//     const update_method = c.wrenMakeCallHandle(vm, "update(_)");
-//     {
-//         // Perform GameEngine.update method call
-//         c.wrenSetSlotHandle(vm, 0, game_engine_class);
-//         c.wrenSetSlotDouble(vm, 1, 6.9);
-//         try handle_result(c.wrenCall(vm, update_method));
-//     }
-
-//     try testing.expectEqualStrings("6.9\n", log.items);
-// }
+    try testing.expectEqualStrings("6.9\n", harness.log.items);
+}
 
 // fn add(vm_opt: ?*c.WrenVM) callconv(.C) void {
 //     const vm = vm_opt orelse {

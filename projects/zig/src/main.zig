@@ -9,12 +9,14 @@ var wren_contexts_global: ?std.AutoHashMap(*c.WrenVM, WrenCtx) = undefined;
 log: ?*std.ArrayList(u8),
 log_to_stdout: bool,
 
-modules: ?*std.StringHashMap(c.WrenForeignMethodFn),
+methods: ?*std.StringHashMap(c.WrenForeignMethodFn),
+classes: ?*std.StringHashMap(c.WrenForeignClassMethods),
 
 const WrenVMOptions = struct {
     log_to_stdout: bool = false,
     log_list: ?*std.ArrayList(u8) = null,
-    modules: ?*std.StringHashMap(c.WrenForeignMethodFn) = null,
+    methods: ?*std.StringHashMap(c.WrenForeignMethodFn) = null,
+    classes: ?*std.StringHashMap(c.WrenForeignClassMethods) = null,
 };
 
 pub fn register_context(vm: *c.WrenVM, opt: WrenVMOptions) !void {
@@ -29,7 +31,8 @@ pub fn register_context(vm: *c.WrenVM, opt: WrenVMOptions) !void {
     try wren_contexts.put(vm, .{
         .log = opt.log_list,
         .log_to_stdout = opt.log_to_stdout,
-        .modules = opt.modules,
+        .methods = opt.methods,
+        .classes = opt.classes,
     });
 }
 
@@ -91,7 +94,7 @@ pub fn bindForeignMethod(
     const vm = vm_opt orelse @panic("Passed null vm");
     const contexts = wren_contexts_global orelse @panic("No wren contexts registered");
     const ctx = contexts.get(vm) orelse @panic("Unregistered context");
-    const modules = ctx.modules orelse @panic("couldn't find modules");
+    const methods = ctx.methods orelse @panic("couldn't find methods");
 
     const module = module_opt orelse @panic("Passed null module");
     const class_name = class_name_opt orelse @panic("Passed null class_name");
@@ -101,9 +104,36 @@ pub fn bindForeignMethod(
 
     const name = std.fmt.bufPrintZ(&buffer, "{s}/{s}.{s}{s}", .{ module, class_name, signature, if (is_static) "static" else "" }) catch return null;
 
-    std.debug.print("Looking for method: {s}", .{name});
+    std.debug.print("Looking for method: {s}\n", .{name});
 
-    return modules.get(name) orelse null;
+    return methods.get(name) orelse null;
+}
+
+pub fn bindForeignClass(
+    vm_opt: ?*c.WrenVM,
+    module_opt: ?[*:0]const u8,
+    class_name_opt: ?[*:0]const u8,
+) callconv(.C) c.WrenForeignClassMethods {
+    const null_class: c.WrenForeignClassMethods = .{
+        .allocate = null,
+        .finalize = null,
+    };
+
+    const vm = vm_opt orelse @panic("Passed null vm");
+    const contexts = wren_contexts_global orelse @panic("No wren contexts registered");
+    const ctx = contexts.get(vm) orelse @panic("Unregistered context");
+    const classes = ctx.classes orelse @panic("couldn't find classes");
+
+    const module = module_opt orelse @panic("Passed null module");
+    const class_name = class_name_opt orelse @panic("Passed null class_name");
+
+    var buffer: [4096]u8 = undefined;
+
+    const name = std.fmt.bufPrintZ(&buffer, "{s}/{s}", .{ module, class_name }) catch return null_class;
+
+    std.debug.print("Looking for class: {s}\n", .{name});
+
+    return classes.get(name) orelse null_class;
 }
 
 pub fn handle_result(result: c.WrenInterpretResult) !void {
@@ -200,8 +230,8 @@ test "foreign method binding" {
     var log = std.ArrayList(u8).init(testing.allocator);
     defer log.deinit();
 
-    var modules = std.StringHashMap(c.WrenForeignMethodFn).init(testing.allocator);
-    defer modules.deinit();
+    var methods = std.StringHashMap(c.WrenForeignMethodFn).init(testing.allocator);
+    defer methods.deinit();
 
     var config: c.WrenConfiguration = undefined;
     c.wrenInitConfiguration(&config);
@@ -217,16 +247,91 @@ test "foreign method binding" {
 
     try register_context(vm, .{
         .log_list = &log,
-        .modules = &modules,
+        .methods = &methods,
     });
     defer free_all_contexts();
 
-    try modules.put("main/Math.add(_,_)static", add);
+    try methods.put("main/Math.add(_,_)static", add);
 
     const module = "main";
     const script =
         \\class Math {
         \\  foreign static add(a, b)
+        \\}
+    ;
+
+    try handle_result(c.wrenInterpret(vm, module, script));
+}
+
+const File = struct {
+    buffer: [32]u8 = undefined,
+    slice: []u8 = undefined,
+    fn allocate(vm_opt: ?*c.WrenVM) callconv(.C) void {
+        const vm = vm_opt orelse @panic("Passed null vm");
+        const contexts = wren_contexts_global orelse @panic("No wren contexts registered");
+        const ctx = contexts.get(vm) orelse @panic("Unregistered context");
+        _ = ctx;
+        const data = c.wrenSetSlotNewForeign(vm, 0, 0, @sizeOf(@This()));
+        _ = data;
+    }
+    fn write(vm_opt: ?*c.WrenVM) callconv(.C) void {
+        const vm = vm_opt orelse @panic("Passed null vm");
+        const self = @ptrCast(*@This(), @constCast(@alignCast(@alignOf(@This()), &c.wrenGetSlotForeign(vm, 0))));
+        const text_res = c.wrenGetSlotString(vm, 1);
+        const text = std.mem.span(text_res);
+        self.slice = std.fmt.bufPrint(&self.buffer, "{s}", .{text}) catch @panic("Couldn't bufPrint");
+    }
+    fn close(vm_opt: ?*c.WrenVM) callconv(.C) void {
+        _ = vm_opt;
+    }
+    fn finalize(self_ptr: ?*anyopaque) callconv(.C) void {
+        const self = @ptrCast(*@This(), @alignCast(@alignOf(@This()), self_ptr));
+        std.debug.print("finalizing {*}, buffer is {s}\n", .{ self, self.buffer });
+        self.* = undefined;
+    }
+};
+
+test "foreign class" {
+    var log = std.ArrayList(u8).init(testing.allocator);
+    defer log.deinit();
+
+    var methods = std.StringHashMap(c.WrenForeignMethodFn).init(testing.allocator);
+    defer methods.deinit();
+
+    var classes = std.StringHashMap(c.WrenForeignClassMethods).init(testing.allocator);
+    defer classes.deinit();
+
+    var config: c.WrenConfiguration = undefined;
+    c.wrenInitConfiguration(&config);
+    {
+        // Configure wren
+        config.writeFn = writeFn;
+        config.errorFn = errorFn;
+        config.bindForeignClassFn = bindForeignClass;
+        config.bindForeignMethodFn = bindForeignMethod;
+    }
+
+    var vm: *c.WrenVM = c.wrenNewVM(&config) orelse return error.NullVM;
+    defer c.wrenFreeVM(vm);
+
+    try register_context(vm, .{
+        .log_list = &log,
+        .methods = &methods,
+        .classes = &classes,
+    });
+    defer free_all_contexts();
+
+    try methods.put("main/File.write(_)", File.write);
+    try methods.put("main/File.close()", File.close);
+    try classes.put("main/File", .{ .allocate = File.allocate, .finalize = File.finalize });
+
+    const module = "main";
+    const script =
+        \\foreign class File {
+        \\  construct create(path) {}
+        \\
+        \\  foreign write(text)
+        \\  foreign close()
         \\}
     ;
 

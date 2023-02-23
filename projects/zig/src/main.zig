@@ -200,11 +200,13 @@ pub fn handle_result(result: c.WrenInterpretResult) !void {
 }
 
 const TestHarness = struct {
-    vm: *VM = undefined,
+    config: Wren = undefined,
     log: std.ArrayListUnmanaged(u8) = .{},
     methods: std.StringHashMapUnmanaged(c.WrenForeignMethodFn) = .{},
     classes: std.StringHashMapUnmanaged(c.WrenForeignClassMethods) = .{},
     allocator: std.mem.Allocator = undefined,
+
+    log_allocations: bool = false,
 
     /// Casts anyopaque to self pointer
     fn from(ptr_opt: ?*anyopaque) *@This() {
@@ -212,9 +214,10 @@ const TestHarness = struct {
         return @ptrCast(*@This(), @constCast(@alignCast(@alignOf(@This()), ptr)));
     }
 
-    /// Creates a new vm on the stack
+    /// Initialize the wren test harness context
     fn init(harness: *@This(), allocator: std.mem.Allocator) !void {
-        var config = Wren.init(.{
+        harness.allocator = allocator;
+        harness.config = Wren.init(.{
             .writeFn = writeFn,
             .errorFn = errorFn,
             .reallocateFn = reallocateFn,
@@ -222,12 +225,14 @@ const TestHarness = struct {
             .bindForeignMethodFn = bindForeignMethod,
             .userData = harness,
         });
-        harness.allocator = allocator;
-        harness.vm = try config.new();
+    }
+
+    /// Creates a new vm
+    fn new(harness: *@This()) !*VM {
+        return try harness.config.new();
     }
 
     pub fn deinit(self: *@This()) void {
-        self.vm.deinit();
         self.log.clearAndFree(self.allocator);
         self.methods.clearAndFree(self.allocator);
         self.classes.clearAndFree(self.allocator);
@@ -284,11 +289,11 @@ const TestHarness = struct {
         new_size: usize,
         user_data: ?*anyopaque,
     ) callconv(.C) ?*anyopaque {
-        // std.debug.print("\n[reallocateFn] {*} {} {*}\n", .{ memory, new_size, user_data });
+        const self = from(user_data);
+        if (self.log_allocations) std.debug.print("\n[reallocateFn] {*} {} {*}\n", .{ memory, new_size, user_data });
+
         // Deinit null
         if (memory == null and new_size == 0) return null;
-
-        const self = from(user_data);
 
         // Allocate
         if (memory == null) {
@@ -298,7 +303,7 @@ const TestHarness = struct {
             var ptr = meta.to_ptr();
             meta.slice.ptr = ptr;
             meta.slice.len = new_size;
-            // std.debug.print("Allocating slice {*} at {*}\n", .{ meta.slice, begin });
+            if (self.log_allocations) std.debug.print("Allocating slice {*} at {*}\n", .{ meta.slice, begin });
             return ptr;
         }
 
@@ -308,7 +313,7 @@ const TestHarness = struct {
         slice.len = calcAllocSize(old_meta.slice.len);
         slice.ptr = @ptrCast([*]u8, old_meta);
 
-        // std.debug.print("Reallocating {*}\n", .{old_meta.slice});
+        if (self.log_allocations) std.debug.print("Reallocating {*}\n", .{old_meta.slice});
 
         const allocSize = if (new_size == 0) 0 else calcAllocSize(new_size);
         const begin = self.allocator.realloc(slice, allocSize) catch return null;
@@ -318,11 +323,11 @@ const TestHarness = struct {
             var ptr = new_meta.to_ptr();
             new_meta.slice.ptr = ptr;
             new_meta.slice.len = new_size;
-            // std.debug.print("\t new location {*}\n", .{new_meta.slice});
+            if (self.log_allocations) std.debug.print("\t new location {*}\n", .{new_meta.slice});
             return ptr;
         }
 
-        // std.debug.print("Freed {*}\n", .{memory});
+        if (self.log_allocations) std.debug.print("\t freed {*}\n", .{memory});
         return null;
     }
 
@@ -382,12 +387,15 @@ test "init wren vm" {
     try harness.init(testing.allocator);
     defer harness.deinit();
 
+    var vm = try harness.new();
+    defer vm.deinit();
+
     const module = "main";
     const script =
         \\System.print("I am running in a VM!")
     ;
 
-    try harness.vm.interpret(module, script);
+    try vm.interpret(module, script);
 
     try testing.expectEqualStrings("I am running in a VM!\n", harness.log.items);
 }
@@ -396,6 +404,9 @@ test "call static method" {
     var harness = TestHarness{};
     try harness.init(testing.allocator);
     defer harness.deinit();
+
+    var vm = try harness.new();
+    defer vm.deinit();
 
     const module = "main";
     const script =
@@ -406,19 +417,19 @@ test "call static method" {
         \\}
     ;
 
-    try harness.vm.interpret(module, script);
+    try vm.interpret(module, script);
 
-    harness.vm.ensureSlots(1);
-    harness.vm.getVariable(module, "GameEngine", 0);
-    const game_engine_class = harness.vm.getSlot(.Handle, 0) orelse return error.GetSlot;
-    defer harness.vm.releaseHandle(game_engine_class);
-    const update_method = harness.vm.makeCallHandle("update(_)") orelse return error.MakeCallHandle;
-    defer harness.vm.releaseHandle(update_method);
+    vm.ensureSlots(2);
+    vm.getVariable(module, "GameEngine", 0);
+    const game_engine_class = vm.getSlot(.Handle, 0) orelse return error.GetSlot;
+    defer vm.releaseHandle(game_engine_class);
+    const update_method = vm.makeCallHandle("update(_)") orelse return error.MakeCallHandle;
+    defer vm.releaseHandle(update_method);
     {
         // Perform GameEngine.update method call
-        harness.vm.setSlot(.Handle, 0, game_engine_class);
-        harness.vm.setSlot(.Double, 1, 6.9);
-        try harness.vm.call(update_method);
+        vm.setSlot(.Handle, 0, game_engine_class);
+        vm.setSlot(.Double, 1, 6.9);
+        try vm.call(update_method);
     }
 
     try testing.expectEqualStrings("6.9\n", harness.log.items);
@@ -439,6 +450,9 @@ test "foreign method binding" {
     try harness.init(testing.allocator);
     defer harness.deinit();
 
+    var vm = try harness.new();
+    defer vm.deinit();
+
     try harness.methods.put(testing.allocator, "main/Math.add(_,_)static", add);
 
     const module = "main";
@@ -449,7 +463,7 @@ test "foreign method binding" {
         \\System.print(Math.add(5, 4))
     ;
 
-    try harness.vm.interpret(module, script);
+    try vm.interpret(module, script);
 
     try testing.expectEqualStrings(
         \\Looking for method: main/Math.add(_,_)static
@@ -467,12 +481,14 @@ const File = struct {
     }
     fn allocate(vm_opt: ?*c.WrenVM) callconv(.C) void {
         const vm = VM.from_anyopaque(vm_opt);
+        vm.ensureSlots(2);
         const self = File.from_anyopaque(vm.setSlotNewForeign(0, 0, @sizeOf(@This())));
         const path = vm.getSlot(.String, 1) orelse @panic("Couldn't get slot string");
         self.*.slice = std.fmt.bufPrint(&self.*.buffer, "{s}\n", .{path}) catch @panic("Couldn't bufPrint");
     }
     fn write(vm_opt: ?*c.WrenVM) callconv(.C) void {
         const vm = VM.from_anyopaque(vm_opt);
+        vm.ensureSlots(2);
         const self = File.from_anyopaque(vm.getSlot(.Foreign, 0));
         const text_res = vm.getSlot(.String, 1) orelse @panic("Couldn't get slot string");
         const text = std.mem.span(text_res);
@@ -492,6 +508,9 @@ test "foreign class" {
     try harness.init(testing.allocator);
     defer harness.deinit();
 
+    var vm = try harness.new();
+    defer vm.deinit();
+
     try harness.classes.put(testing.allocator, "main/File", .{ .allocate = File.allocate, .finalize = File.finalize });
     try harness.methods.put(testing.allocator, "main/File.write(_)", File.write);
     try harness.methods.put(testing.allocator, "main/File.close()", File.close);
@@ -509,7 +528,7 @@ test "foreign class" {
         \\file.close()
     ;
 
-    try harness.vm.interpret(module, script);
+    try vm.interpret(module, script);
     try testing.expectEqualStrings(
         \\Looking for class: main/File
         \\Looking for method: main/File.write(_)
@@ -522,6 +541,9 @@ test "hello fibers" {
     var harness = TestHarness{};
     try harness.init(testing.allocator);
     defer harness.deinit();
+
+    var vm = try harness.new();
+    defer vm.deinit();
 
     const module = "main";
     const script =
@@ -537,7 +559,7 @@ test "hello fibers" {
         \\while (!adjectives.isDone) System.print(adjectives.call())
     ;
 
-    try harness.vm.interpret(module, script);
+    try vm.interpret(module, script);
     try testing.expectEqualStrings(
         \\Hello, world!
         \\small

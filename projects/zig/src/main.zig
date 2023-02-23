@@ -1,3 +1,7 @@
+//! This file contains tests for the Zig Wren API wrapper.
+//! Allocator wrapper based on https://github.com/koljakube/zapata/blob/main/src/zapata/allocator_wrapper.zig
+
+/// A test harness for running the Wren VM
 const TestHarness = struct {
     config: Wren = undefined,
     log: std.ArrayListUnmanaged(u8) = .{},

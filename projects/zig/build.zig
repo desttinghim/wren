@@ -15,11 +15,18 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    b.addModule(.{
+        .name = "wren",
+        .source_file = .{ .path = "src/Wren.zig" },
+    });
+
+    const wren_version = std.builtin.Version{ .major = 0, .minor = 4, .patch = 0 };
+
     const lib = b.addStaticLibrary(.{
         .name = "wren",
         .target = target,
         .optimize = optimize,
-        .version = .{ .major = 0, .minor = 4, .patch = 0 },
+        .version = wren_version,
     });
 
     lib.linkLibC();

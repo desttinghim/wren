@@ -9,8 +9,10 @@ config: c.WrenConfiguration = undefined,
 const Options = struct {
     writeFn: ?c.WrenWriteFn,
     errorFn: ?c.WrenErrorFn,
+    reallocateFn: ?c.WrenReallocateFn,
     bindForeignClassFn: ?c.WrenBindForeignClassFn,
     bindForeignMethodFn: ?c.WrenBindForeignMethodFn,
+    userData: ?*anyopaque,
 };
 
 pub fn init(opt: Options) Wren {
@@ -19,8 +21,10 @@ pub fn init(opt: Options) Wren {
     // Configure wren
     if (opt.writeFn) |writeFn| self.config.writeFn = writeFn;
     if (opt.errorFn) |errorFn| self.config.errorFn = errorFn;
+    if (opt.reallocateFn) |reallocateFn| self.config.reallocateFn = reallocateFn;
     if (opt.bindForeignClassFn) |bindForeignClassFn| self.config.bindForeignClassFn = bindForeignClassFn;
     if (opt.bindForeignMethodFn) |bindForeignMethodFn| self.config.bindForeignMethodFn = bindForeignMethodFn;
+    if (opt.userData) |userData| self.config.userData = userData;
     return self;
 }
 
@@ -57,8 +61,8 @@ const VM = opaque {
     pub fn call(vm: *VM, method: *c.WrenHandle) !void {
         try handle_result(c.wrenCall(vm.as_raw(), method));
     }
-    pub fn releaseHandle(vm: *VM, handle: *c.WrenHandle) !void {
-        try handle_result(c.wrenReleaseHandle(vm.as_raw(), handle));
+    pub fn releaseHandle(vm: *VM, handle: *c.WrenHandle) void {
+        c.wrenReleaseHandle(vm.as_raw(), handle);
     }
     pub fn getSlotCount(vm: *VM) c_int {
         return c.wrenGetSlotCount(vm.as_raw());
@@ -200,6 +204,7 @@ const TestHarness = struct {
     log: std.ArrayListUnmanaged(u8) = .{},
     methods: std.StringHashMapUnmanaged(c.WrenForeignMethodFn) = .{},
     classes: std.StringHashMapUnmanaged(c.WrenForeignClassMethods) = .{},
+    allocator: std.mem.Allocator = undefined,
 
     /// Casts anyopaque to self pointer
     fn from(ptr_opt: ?*anyopaque) *@This() {
@@ -208,29 +213,31 @@ const TestHarness = struct {
     }
 
     /// Creates a new vm on the stack
-    fn init(harness: *@This()) !void {
+    fn init(harness: *@This(), allocator: std.mem.Allocator) !void {
         var config = Wren.init(.{
             .writeFn = writeFn,
             .errorFn = errorFn,
+            .reallocateFn = reallocateFn,
             .bindForeignClassFn = bindForeignClass,
             .bindForeignMethodFn = bindForeignMethod,
+            .userData = harness,
         });
+        harness.allocator = allocator;
         harness.vm = try config.new();
-        harness.vm.setUserData(harness);
     }
 
     pub fn deinit(self: *@This()) void {
         self.vm.deinit();
-        self.log.clearAndFree(testing.allocator);
-        self.methods.clearAndFree(testing.allocator);
-        self.classes.clearAndFree(testing.allocator);
+        self.log.clearAndFree(self.allocator);
+        self.methods.clearAndFree(self.allocator);
+        self.classes.clearAndFree(self.allocator);
     }
 
     fn writeFn(vm_opt: ?*c.WrenVM, text_opt: ?[*:0]const u8) callconv(.C) void {
         const vm = VM.from_anyopaque(vm_opt);
         const self = from(vm.getUserData());
         const text = text_opt orelse @panic("null string");
-        const writer = self.log.writer(testing.allocator);
+        const writer = self.log.writer(self.allocator);
         std.fmt.format(writer, "{s}", .{text}) catch @panic("Error formatting write");
     }
 
@@ -246,7 +253,7 @@ const TestHarness = struct {
         const msg = msg_opt orelse @panic("null msg");
 
         const self = from(vm.getUserData());
-        const writer = self.log.writer(testing.allocator);
+        const writer = self.log.writer(self.allocator);
 
         _ = switch (errorType) {
             c.WREN_ERROR_COMPILE => std.fmt.format(writer, "[{s} line {}] [Error] {s}\n", .{ module, line, msg }),
@@ -255,6 +262,70 @@ const TestHarness = struct {
             else => std.fmt.format(writer, "[Unexpected Error] {s}", .{msg}),
         } catch @panic("Error formatting error");
     }
+
+    const MemoryMetadata = struct {
+        slice: []u8,
+        fn from_ptr(memory: ?*anyopaque) MemoryMetadataPtr {
+            return @intToPtr(MemoryMetadataPtr, @ptrToInt(memory) - @sizeOf(MemoryMetadata));
+        }
+        fn to_ptr(metadata: MemoryMetadataPtr) [*]u8 {
+            return @intToPtr([*]u8, @ptrToInt(metadata) + @sizeOf(MemoryMetadata));
+        }
+    };
+
+    const MemoryMetadataPtr = *align(1) MemoryMetadata;
+
+    fn calcAllocSize(requested: usize) usize {
+        return requested + @sizeOf(MemoryMetadata);
+    }
+
+    fn reallocateFn(
+        memory: ?*anyopaque,
+        new_size: usize,
+        user_data: ?*anyopaque,
+    ) callconv(.C) ?*anyopaque {
+        // std.debug.print("\n[reallocateFn] {*} {} {*}\n", .{ memory, new_size, user_data });
+        // Deinit null
+        if (memory == null and new_size == 0) return null;
+
+        const self = from(user_data);
+
+        // Allocate
+        if (memory == null) {
+            std.debug.assert(new_size != 0);
+            const begin = self.allocator.alloc(u8, calcAllocSize(new_size)) catch return null;
+            var meta = @ptrCast(MemoryMetadataPtr, begin);
+            var ptr = meta.to_ptr();
+            meta.slice.ptr = ptr;
+            meta.slice.len = new_size;
+            // std.debug.print("Allocating slice {*} at {*}\n", .{ meta.slice, begin });
+            return ptr;
+        }
+
+        // Reallocate
+        var old_meta = MemoryMetadata.from_ptr(memory);
+        var slice: []u8 = undefined;
+        slice.len = calcAllocSize(old_meta.slice.len);
+        slice.ptr = @ptrCast([*]u8, old_meta);
+
+        // std.debug.print("Reallocating {*}\n", .{old_meta.slice});
+
+        const allocSize = if (new_size == 0) 0 else calcAllocSize(new_size);
+        const begin = self.allocator.realloc(slice, allocSize) catch return null;
+
+        if (new_size != 0) {
+            var new_meta = @ptrCast(MemoryMetadataPtr, begin);
+            var ptr = new_meta.to_ptr();
+            new_meta.slice.ptr = ptr;
+            new_meta.slice.len = new_size;
+            // std.debug.print("\t new location {*}\n", .{new_meta.slice});
+            return ptr;
+        }
+
+        // std.debug.print("Freed {*}\n", .{memory});
+        return null;
+    }
+
     fn bindForeignMethod(
         vm_opt: ?*c.WrenVM,
         module_opt: ?[*:0]const u8,
@@ -268,7 +339,7 @@ const TestHarness = struct {
         const signature = signature_opt orelse @panic("Passed null signature");
 
         const self = from(vm.getUserData());
-        const writer = self.log.writer(testing.allocator);
+        const writer = self.log.writer(self.allocator);
 
         var buffer: [4096]u8 = undefined;
 
@@ -294,7 +365,7 @@ const TestHarness = struct {
         const class_name = class_name_opt orelse @panic("Passed null class_name");
 
         const self = from(vm.getUserData());
-        const writer = self.log.writer(testing.allocator);
+        const writer = self.log.writer(self.allocator);
 
         var buffer: [4096]u8 = undefined;
 
@@ -308,7 +379,7 @@ const TestHarness = struct {
 
 test "init wren vm" {
     var harness = TestHarness{};
-    try harness.init();
+    try harness.init(testing.allocator);
     defer harness.deinit();
 
     const module = "main";
@@ -323,7 +394,7 @@ test "init wren vm" {
 
 test "call static method" {
     var harness = TestHarness{};
-    try harness.init();
+    try harness.init(testing.allocator);
     defer harness.deinit();
 
     const module = "main";
@@ -340,7 +411,9 @@ test "call static method" {
     harness.vm.ensureSlots(1);
     harness.vm.getVariable(module, "GameEngine", 0);
     const game_engine_class = harness.vm.getSlot(.Handle, 0) orelse return error.GetSlot;
+    defer harness.vm.releaseHandle(game_engine_class);
     const update_method = harness.vm.makeCallHandle("update(_)") orelse return error.MakeCallHandle;
+    defer harness.vm.releaseHandle(update_method);
     {
         // Perform GameEngine.update method call
         harness.vm.setSlot(.Handle, 0, game_engine_class);
@@ -363,7 +436,7 @@ fn add(vm_opt: ?*c.WrenVM) callconv(.C) void {
 
 test "foreign method binding" {
     var harness = TestHarness{};
-    try harness.init();
+    try harness.init(testing.allocator);
     defer harness.deinit();
 
     try harness.methods.put(testing.allocator, "main/Math.add(_,_)static", add);
@@ -416,7 +489,7 @@ const File = struct {
 
 test "foreign class" {
     var harness = TestHarness{};
-    try harness.init();
+    try harness.init(testing.allocator);
     defer harness.deinit();
 
     try harness.classes.put(testing.allocator, "main/File", .{ .allocate = File.allocate, .finalize = File.finalize });
@@ -447,7 +520,7 @@ test "foreign class" {
 
 test "hello fibers" {
     var harness = TestHarness{};
-    try harness.init();
+    try harness.init(testing.allocator);
     defer harness.deinit();
 
     const module = "main";
